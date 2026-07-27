@@ -3,6 +3,7 @@ import csv
 import hashlib
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -18,6 +19,14 @@ HEADERS = {
     )
 }
 FIELDNAMES = ["date", "fighter a", "fighter b", "result"]
+DATE_FORMAT = "%B %d, %Y"
+
+
+def parse_event_date(date_str: str) -> datetime | None:
+    try:
+        return datetime.strptime(date_str, DATE_FORMAT)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_session_page(session: requests.Session, url: str) -> requests.Response:
@@ -93,7 +102,7 @@ def load_existing(path: Path) -> tuple[set[str], set[tuple[str, str, str]]]:
     """Load parsed event dates and fight keys already in the CSV.
 
     The last date in the file is treated as possibly incomplete (scrape may have
-    stopped mid-event), so it is not skipped and will be re-checked.
+    stopped mid-event while appending), so it is not skipped and will be re-checked.
     """
     parsed_dates: set[str] = set()
     fight_keys: set[tuple[str, str, str]] = set()
@@ -105,15 +114,71 @@ def load_existing(path: Path) -> tuple[set[str], set[tuple[str, str, str]]]:
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            date = row["date"]
+            date = row.get("date") or ""
+            fighter_a = row.get("fighter a") or ""
+            fighter_b = row.get("fighter b") or ""
+            if parse_event_date(date) is None or not fighter_a or not fighter_b:
+                continue
             parsed_dates.add(date)
-            fight_keys.add((date, row["fighter a"], row["fighter b"]))
+            fight_keys.add((date, fighter_a, fighter_b))
             last_date = date
 
     if last_date is not None:
         parsed_dates.discard(last_date)
 
     return parsed_dates, fight_keys
+
+
+def rewrite_sorted(path: Path) -> tuple[int, int]:
+    """Rewrite CSV newest→oldest. Drop corrupt rows and duplicates.
+
+    Returns (rows_kept, rows_dropped).
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return 0, 0
+
+    with path.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    cleaned: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    dropped = 0
+
+    for row in rows:
+        date = (row.get("date") or "").strip()
+        fighter_a = (row.get("fighter a") or "").strip()
+        fighter_b = (row.get("fighter b") or "").strip()
+        result = (row.get("result") or "").strip()
+
+        if parse_event_date(date) is None or not fighter_a or not fighter_b:
+            dropped += 1
+            continue
+
+        key = (date, fighter_a, fighter_b)
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        cleaned.append(
+            {
+                "date": date,
+                "fighter a": fighter_a,
+                "fighter b": fighter_b,
+                "result": result,
+            }
+        )
+
+    # Stable sort keeps within-event fight order from the scrape.
+    cleaned.sort(key=lambda r: parse_event_date(r["date"]), reverse=True)
+
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(cleaned)
+    tmp_path.replace(path)
+
+    return len(cleaned), dropped
 
 
 def main():
@@ -169,9 +234,14 @@ def main():
             parsed_dates.add(event_date)
             time.sleep(0.3)
 
+    kept, dropped = rewrite_sorted(OUTPUT_PATH)
     print(
         f"Done. Wrote {fight_count} new fights "
         f"({skipped} events skipped) to {OUTPUT_PATH}",
+        flush=True,
+    )
+    print(
+        f"Reordered CSV newest→oldest ({kept} rows kept, {dropped} dropped)",
         flush=True,
     )
 
